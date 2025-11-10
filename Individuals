@@ -1,0 +1,38 @@
+# Lets creates some variables on individual level 
+individual_defense_one_play <- kinematic %>%
+  #only evaluating defenders
+  filter(player_role == 'Defensive Coverage') %>% 
+  #want per player
+  group_by(player_name, nfl_id, player_position) %>%
+  summarise(
+    mean_distance_closed   = mean(distance_closed[distance_closed > 0], na.rm = TRUE),
+    total_distance_closed  = sum(distance_closed[distance_closed > 0], na.rm = TRUE),
+    peak_velocity_toward_ball = max(velocity_towards_ball, na.rm = TRUE),
+    mean_velocity_toward_ball = mean(velocity_towards_ball, na.rm = TRUE),
+    min_distance_to_ball   = min(distance, na.rm = TRUE),
+    mean_costheta          = mean(costheta, na.rm = TRUE),
+    pct_facing_ball        = mean(is_facing_ball, na.rm = TRUE),
+    frames_tracked         = n()
+  ) %>%
+  ungroup()
+
+#want to create a metric on who closed the most distance. 
+total_velo <- individual_defense_one_play %>%
+  mutate(
+    #make a mean of 100 and standard deviation of 15
+    total_velo_index = 100 + 15 * (
+      scale(mean_velocity_toward_ball) 
+    )
+  )
+
+
+top_velo <- total_velo %>%
+  filter(frames_tracked >= 25) %>% 
+  arrange(desc(total_velo_index)) %>%
+  slice_head(n = 20)
+bottom_velo <- total_velo %>% 
+  filter(frames_tracked >= 25) %>% 
+  arrange(total_velo_index) %>% 
+  slice_head(n = 20)
+
+
