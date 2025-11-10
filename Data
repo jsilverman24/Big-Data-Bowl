@@ -1,0 +1,206 @@
+#You are tasked to create a metric or video to analyze NFL player movement during the video frames after the ball is thrown.
+
+library(tidyverse)
+library(xgboost)
+library(caret)
+#data about game situation and extra
+supplements <- read_csv("supplementary_data.csv") 
+  
+#this is data before the pass was thrown
+input <- read_csv("input_2023_w01.csv")
+#this is data after the pass was thrown
+output <- read_csv("output_2023_w01.csv")
+
+#Now let us dive into how defenses rotate and react as a unit after the ball is thrown.
+
+#To start, I am going to add the receiver's position for each frame to set up for a case_when to see if the defender is moving
+#towardsd the ball or not. We need to add the targeted receiver's position.
+
+#Let's select what we need so the data does not get overfilled.
+clean_input <- input %>% 
+  select(game_id,play_id, nfl_id, frame_id, player_name, player_position, player_role, x, y, s, a , dir, o, ball_land_x, ball_land_y)
+
+#now let us get the final frames of everyone at the time of throw so it is a snapshot at time of throw.
+target_snapshot <- clean_input %>% 
+  #group by game, play, and player so we can filter by each person's locations.
+  group_by(game_id, play_id, nfl_id) %>% 
+  #want to filter for only the players we care about, which is targeted receiver and defenders
+  filter(player_role %in% c("Targeted Receiver","Defensive Coverage")) %>% 
+  #filter for when frame id is equal to or greater than the max.
+  filter(frame_id >= max(frame_id)) %>% 
+  #we need to change the x and y variables so they do not mismatch with the x and y outside of the snapshot 
+  rename(snapshot_x = x,
+         snapshot_y = y,
+         final_frame = frame_id)
+#great now we have a target snapshot.
+#Let us left join the two sets together so we have snapshots with what defenders do after the throw.
+targeted <- left_join(output, target_snapshot, by = c('game_id',
+                                                      'play_id', 
+                                                      'nfl_id'))
+
+#Lets first perform an analysis to see when players reacted, how did that impact EPA.
+#We need to define a reaction as moving towards the direction of the ball correctly. So, if the ball_land placement
+#is greater, we need to move toward that placement, and so each frame must be in the direction of the ball. 
+#Let's get the distance from the ball
+distance <- targeted %>% 
+  #Let us get the distance from the ball at snapshot. We do this by taking the regular distance formula
+  mutate(snapshot_distance = sqrt
+        ((snapshot_x - ball_land_x)^2+(snapshot_y - ball_land_y)^2)) %>% 
+  #now lets get a distance from the ball for each frame. 
+  mutate(distance = sqrt
+         ((x - ball_land_x)^2+(y - ball_land_y)^2)) 
+
+#Now we have to say if they reaction or not. If the distance at a frame is smaller than the distance prior to that frame, 
+#it is a good reaction. 
+reaction <- distance %>% 
+  #grouping by for manipulation
+  group_by(play_id, game_id, nfl_id) %>% 
+  #we need to do a case when to subtract the current distance from the previous distance to see if they reacted.
+  #specifically for the first frame, we need to base it on the snapshot distance. Create the previous_distance variable
+  #based on an if/else statement if the frame_id is the first frame or not
+  mutate(previous_distance = if_else(frame_id == min(frame_id),snapshot_distance,lag(distance))) %>% 
+  mutate(reaction = case_when(distance - previous_distance < 0 ~ 1, TRUE ~ 0)) 
+
+#now we are going to get into the physics before of the project. We are going to look at velocities, accelerations, and pursuit angles.
+#First, let's get the path of where the defender should go and where they did go
+direction_deviation <- reaction %>% 
+  #this is where the defenders should go
+  mutate(should_x = ball_land_x - x,
+         should_y = ball_land_y - y) %>% 
+  #this is where defenders DID go
+  mutate(previous_distance_x = if_else(frame_id == min(frame_id),snapshot_x,lag(x))) %>% 
+  mutate(previous_distance_y = if_else(frame_id == min(frame_id),snapshot_y,lag(y))) %>% 
+  mutate(did_x = x - previous_distance_x,
+         did_y = y - previous_distance_y)
+
+#Now lets go back to multivariable. We have two vectors - should and did. #We are going to look at the dot product of both.
+#If should and did are equal, the dot product would be 1 because the angle is zero. IF should and did are perpendicular,
+#the dot product would be 0 because the angle is 90 and therefore the pursuit is neutral. We can see how similar the vectors are,
+#indicating how good the pursuit was.
+dot <- direction_deviation %>% 
+  #need to calculate the magnitudes of both vectors
+  mutate(magnitude_did = sqrt((did_x)^2+ (did_y)^2),
+         magnitude_should = sqrt((should_x)^2+(should_y)^2)) %>% 
+  #getting the dot product so we can now get to cosine theta
+  mutate(dot = did_x * should_x + did_y * should_y) %>% 
+  #getting cos theta. now this is a scale of -1 to 1, 1 being perfectly to the ball, 0 being netural, and -1 being opposite 
+  mutate(costheta = dot / (magnitude_did * magnitude_should))
+  
+#Great. Now we need distance changed per frame so we can calculate speed and acceleration.
+kinematic <- dot %>%
+  #group by
+  group_by(game_id, play_id, nfl_id) %>% 
+  #create variables
+  mutate(
+    #make change_x and change_y the x and y changes in each direction
+    change_x = if_else(frame_id == min(frame_id), 0, did_x - lag(did_x)),
+    change_y = if_else(frame_id == min(frame_id), 0, did_y - lag(did_y)),
+    #calculate distance
+    dist_each_frame = sqrt((change_x)^2 + (change_y)^2),
+    #calculate speed
+    speed = if_else(frame_id == min(frame_id), 0, dist_each_frame / 0.1),
+    #calculate acceleration
+    acceleration = if_else(frame_id == min(frame_id), 0, (speed - lag(speed)) / 0.1),
+    #now lets get the direction angle that represents what angle the player is moving in. Need to multiply by 
+    #180/pi since it is in radians and %% 360 ensures that it maximizes at 360 degrees.
+    dir_per_frame = if_else(frame_id == min(frame_id), 0, (atan2(change_y, change_x) * 180 / pi) %% 360)
+  ) %>%
+  #great we have a ton of kinematics, but let us keep building them.
+  mutate(
+    #speed times costheta gives you the velocity that the player exerts towards the ball.
+    #This gives us the horiziontal velocity towards the ball
+    velocity_towards_ball = speed * costheta,
+    #calculate accerlation towards the ball
+    acceleration_towards_ball = if_else(frame_id == min(frame_id), 0, (velocity_towards_ball - lag(velocity_towards_ball)) / 0.1),
+    #calculate the distance closed per frame
+    distance_closed = previous_distance - distance,
+    #calculate the pursuit angle needed based on the current position and where the ball lands
+    pursuit_dir = (atan2(ball_land_y - y, ball_land_x - x) * 180 / pi) %% 360,
+      #calculate how much the defender went towards the ball
+    dir_towards_ball_angle = (abs(dir_per_frame - pursuit_dir)),
+    #calculate the orientation of the defender towards the ball
+    o_towards_ball = abs(o - pursuit_dir) ,
+    #now an if/else to see if they are facing the ball
+    is_facing_ball = if_else(o_towards_ball <= 30, 1,0)
+  )
+
+#Now let's get stats per defenders to see who stands out
+defender_summary <- kinematic %>% 
+  group_by(game_id,nfl_id,play_id, player_position) %>% 
+  #whats the mean alignment of a player
+  summarize(mean_alignment = mean(costheta, na.rm = T),
+            #maximum velocity towards the ball
+            peak_velocity_toward_ball = max(velocity_towards_ball, na.rm = TRUE),
+            #maximum acceleration towards the ball
+            peak_accel_toward_ball = max(acceleration_towards_ball, na.rm = TRUE),
+            #how many frames does it take until the defender moves towards the ball.
+            #runs a true/false for if there was velocity towards the ball, then grabs the frame id and subtracts it from
+            #minimum frame id, else not applicable
+            reaction_latency = if (any(velocity_towards_ball > 0)) {
+              min(frame_id[velocity_towards_ball > 0]) - min(frame_id)
+            } else {
+              NA_real_   
+            },
+            #total yards closed during ball flight
+            cum_distance_closed = sum(distance_closed[distance_closed > 0], na.rm = TRUE),
+            #minimum distance achieved to the ball
+            min_distance_to_ball = min(distance, na.rm = TRUE),
+            #percent of facing the ball
+            pct_facing_ball = mean(is_facing_ball, na.rm = TRUE),
+            #average pursuit angle
+            avg_pursuit_angle = mean(dir_towards_ball_angle, na.rm = TRUE)
+  )
+#Now we have summary statistics for defenders! This will be useful when we conclude which variables have the most impact to 
+#see which defenders are best.
+#For now we will get it on team level
+team_summary <- defender_summary %>%
+  #group by game and play, its now together by team
+  group_by(game_id, play_id) %>%
+  #create variables
+  summarise(
+    #mean taem alignment of the players
+    team_mean_alignment      = mean(mean_alignment, na.rm = TRUE),
+    #median team alignment of the players
+    team_median_alignment    = median(mean_alignment, na.rm = TRUE),
+    #max team alignment of the players
+    team_peak_alignment      = max(mean_alignment, na.rm = TRUE),
+    #standard deviation of the alignment of the plalyers
+    team_alignment_sd        = sd(mean_alignment, na.rm = TRUE),      
+    #mean velocity of the players and max
+    team_mean_velocity_toward_ball = mean(peak_velocity_toward_ball, na.rm = TRUE),
+    team_peak_velocity_toward_ball = max(peak_velocity_toward_ball, na.rm = TRUE),
+    #mean acceleration of the players and max
+    team_mean_accel_toward_ball = mean(peak_accel_toward_ball, na.rm = TRUE),
+    team_peak_accel_toward_ball = max(peak_accel_toward_ball, na.rm = TRUE),
+    #mean reaction and minimum reaction and standard deviation
+    team_mean_reaction_latency = mean(reaction_latency, na.rm = TRUE),
+    #some plays have a defender never reacting. So we search if there is any finite values and then grab minimums
+    team_min_reaction_latency = if (any(is.finite(reaction_latency))) {
+      min(reaction_latency, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    team_reaction_latency_sd   = sd(reaction_latency, na.rm = TRUE),   
+    #distance accumulated means, sums, mins and distance to the ball.
+    team_mean_distance_closed  = mean(cum_distance_closed, na.rm = TRUE),
+    team_total_distance_closed = sum(cum_distance_closed, na.rm = TRUE),
+    team_min_distance_to_ball  = min(min_distance_to_ball, na.rm = TRUE),
+    team_mean_distance_to_ball = mean(min_distance_to_ball, na.rm = TRUE),
+    #team means for angles and how much is facing the ball
+    team_mean_pct_facing_ball  = mean(pct_facing_ball, na.rm = TRUE),
+    team_mean_pursuit_angle    = mean(avg_pursuit_angle, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#great. we now have our team statistics. Now let us merge with supplments so we can get out dependent variables
+team_data <- left_join(team_summary, supplements, by = c('game_id', 'play_id')) %>% 
+  #case when for pass result making it a binary variable
+  mutate(is_complete = case_when(pass_result == "C" ~ 1, TRUE ~ 0)) %>% 
+  #dropping NA's for EPA
+  drop_na(expected_points_added) %>% 
+  #for numbers replace . with 0
+  mutate(across(where(is.numeric), ~ replace_na(., 0))) %>% 
+  mutate(yac = yards_gained - pass_length) %>% 
+  mutate(zone = if_else(team_coverage_man_zone == "ZONE_COVERAGE",1,0))
+
+
