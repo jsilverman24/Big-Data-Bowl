@@ -1,1 +1,391 @@
+#Awesome. We now have our dataset ready for modeling. 
+
+glimpse(team_data)
+summary(team_data$expected_points_added)
+summary(team_data$is_complete)
+
+
+#Lets run a linear regression with our data
+yac_model <- lm(
+  yac ~ 
+    team_mean_alignment +
+    team_median_alignment +
+    team_peak_alignment +
+    team_alignment_sd +
+    team_mean_velocity_toward_ball +
+    team_peak_velocity_toward_ball +
+    team_mean_accel_toward_ball +
+    team_peak_accel_toward_ball +
+    team_mean_reaction_latency +
+    team_min_reaction_latency +
+    team_reaction_latency_sd +
+    team_mean_distance_closed +
+    team_total_distance_closed +
+    team_min_distance_to_ball +
+    team_mean_distance_to_ball +
+    team_mean_pct_facing_ball +
+    team_mean_pursuit_angle +
+    zone,
+  data = team_data
+)
+#explains 42% of the variance in yac!!!
+summary(yac_model)
+
+
+
+#drops Nas and create the dataset for our xgboost
+team_data_xgb <- team_data %>%
+  select(
+    yac,
+    team_mean_alignment,
+    team_median_alignment,
+    team_peak_alignment,
+    team_alignment_sd,
+    team_mean_velocity_toward_ball,
+    team_peak_velocity_toward_ball,
+    team_mean_accel_toward_ball,
+    team_peak_accel_toward_ball,
+    team_mean_reaction_latency,
+    team_min_reaction_latency,
+    team_reaction_latency_sd,
+    team_mean_distance_closed,
+    team_total_distance_closed,
+    team_min_distance_to_ball,
+    team_mean_distance_to_ball,
+    team_mean_pct_facing_ball,
+    team_mean_pursuit_angle
+  ) %>%
+  drop_na()
+
+#seperate the dependent and indepedent variable. It says select all columns except yac
+X <- as.matrix(team_data_xgb %>% select(-yac))
+y <- team_data_xgb$yac
+
+#Sets a random seed so the the data is reproducible
+set.seed(42)
+#Train index is a vector of row numbers that come from the yac variable. 
+#Createdatapartition splits our data into testing and training data
+#y is the yac or dependent variable, p = .8 grabs 80% of the data so we can predict it on the 20%.
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+#Takes the x inputs from the training index so we can train on these
+X_train <- X[train_index, ]
+#Takes the y inputs from the training index so we can train on these.
+y_train <- y[train_index]
+#Takes the other x inputs, the remaining 20% so we can test on these
+X_test  <- X[-train_index, ]
+#Takes the other y inputs, the remaining 20% so we can test on these
+y_test  <- y[-train_index]
+
+#Creates DMatrices from our training and testing data
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+#Creating parameters for xgboost
+params <- list(
+  #says objective is squared error in a regression
+  objective = "reg:squarederror",
+  #evaluate by root mean square error
+  eval_metric = "rmse",
+  #how fast the model learns
+  eta = 0.05,
+  #limits complexity of each tree
+  max_depth = 4,
+  #each tree trains on a random 80%
+  subsample = 0.8,
+  #each tree uses 80% of variables randomly
+  colsample_bytree = 0.8
+)
+
+#set seed again
+set.seed(42)
+#train the model
+xgb_fit <- xgb.train(
+  #params are params
+  params = params,
+  #data is our data
+  data = dtrain,
+  #maximum amount of iterations
+  nrounds = 1000,
+  #monitor performance on training and evaluation data
+  watchlist = list(train = dtrain, eval = dtest),
+  #if RMSE isn't improving after 50 rounds, stop
+  early_stopping_rounds = 50,
+  #print resulte every 50 rounds
+  print_every_n = 50
+)
+
+#makes predictions on new data
+y_pred <- predict(xgb_fit, newdata = dtest)
+
+#Get RMSE and R^2
+rmse <- sqrt(mean((y_test - y_pred)^2))
+r2   <- 1 - sum((y_test - y_pred)^2) / sum((y_test - mean(y_test))^2)
+
+#9.52 RMSE
+cat("Test RMSE:", round(rmse, 2), "\n")
+#.412 R^2
+cat("Test R²:", round(r2, 3), "\n")
+#see each variable's importance to the model
+importance <- xgb.importance(model = xgb_fit)
+#plot the importance
+xgb.plot.importance(importance, top_n = 10)
+
+# ---- XGBoost Overfitting ----
+# Training predictions
+train_pred_xgb <- predict(xgb_fit, newdata = dtrain)
+
+# Training performance
+train_rmse_xgb <- sqrt(mean((y_train - train_pred_xgb)^2))
+train_r2_xgb <- 1 - sum((y_train - train_pred_xgb)^2) / sum((y_train - mean(y_train))^2)
+
+# Print both for comparison
+cat("XGBoost Train RMSE:", round(train_rmse_xgb, 2), " | Test RMSE:", round(rmse, 2), "\n")
+#XGBoost Train R²: 0.911  | Test R²: 0.39  it is overfitting here
+cat("XGBoost Train R²:", round(train_r2_xgb, 3), " | Test R²:", round(r2, 3), "\n")
+
+
+plot(y_test, y_pred, 
+     xlab = "Actual YAC", 
+     ylab = "Predicted YAC", 
+     main = "XGBoost YAC Predictions")
+abline(0, 1, col = "red")
+
+#Lets run a random forest model for YAC
+#load in package
+library(randomForest)
+
+# Prepare data by re-using xgboost problems 
+rf_data <- team_data_xgb
+
+#set seed
+set.seed(67)
+#separate training data and test data 
+train_index <- createDataPartition(rf_data$yac, p = 0.8, list = FALSE)
+#training data
+train_rf <- rf_data[train_index, ]
+#testing data
+test_rf  <- rf_data[-train_index, ]
+
+# Train Random Forest
+rf_model <- randomForest(
+  #dependent variable is yac, independent is all other variables
+  yac ~ .,                
+  #dataset
+  data = train_rf,
+  #number of trees
+  ntree = 500,           
+  #number of variables from split
+  mtry = floor(sqrt(ncol(train_rf) - 1)), 
+  #Compute important feature metrics
+  importance = TRUE,      
+  na.action = na.omit
+)
+
+# Predict on test set
+rf_preds <- predict(rf_model, newdata = test_rf)
+
+# Evaluate performance
+rf_rmse <- sqrt(mean((test_rf$yac - rf_preds)^2))
+rf_r2   <- 1 - sum((test_rf$yac - rf_preds)^2) / sum((test_rf$yac - mean(test_rf$yac))^2)
+
+
+#Random Forest Test RMSE: 8.65 
+#Random Forest Test R²: 0.408 
+cat("Random Forest Test RMSE:", round(rf_rmse, 2), "\n")
+cat("Random Forest Test R²:", round(rf_r2, 3), "\n")
+
+# Training predictions
+rf_train_preds <- predict(rf_model, newdata = train_rf)
+
+# Training metrics
+rf_train_rmse <- sqrt(mean((train_rf$yac - rf_train_preds)^2))
+rf_train_r2 <- 1 - sum((train_rf$yac - rf_train_preds)^2) / sum((train_rf$yac - mean(train_rf$yac))^2)
+
+cat("Random Forest Train RMSE:", round(rf_train_rmse, 2), " | Test RMSE:", round(rf_rmse, 2), "\n")
+cat("Random Forest Train R²:", round(rf_train_r2, 3), " | Test R²:", round(rf_r2, 3), "\n")
+
+
+# Plot predicted vs actual
+plot(test_rf$yac, rf_preds,
+     xlab = "Actual YAC",
+     ylab = "Predicted YAC",
+     main = "Random Forest YAC Predictions")
+abline(0, 1, col = "red")
+
+# Variable importance
+importance_df <- data.frame(Feature = rownames(importance(rf_model)),
+                            Importance = importance(rf_model)[, "%IncMSE"])
+importance_df <- importance_df[order(-importance_df$Importance), ]
+
+par(mar = c(10, 6, 4, 2))  # enlarge bottom margin for rotated text
+barplot(
+  height = importance_df$Importance[1:8],
+  names.arg = importance_df$Feature[1:8],
+  las = 2,                   # rotate labels vertically
+  cex.names = 0.8,           # shrink font size
+  main = "Top 8 Important Features - Random Forest",
+  ylab = "% Increase in MSE",
+  col = "skyblue"
+)
+
+#Lasso Regression
+library(glmnet)
+#include every variable except yac
+X <- model.matrix(yac ~ ., data = team_data_xgb)[, -1]
+#dependent variable
+y <- team_data_xgb$yac
+
+#set seed
+# Split data the same way
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test  <- X[-train_index, ]
+y_test  <- y[-train_index]
+
+# ----- LASSO -----
+set.seed(876)
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1)
+best_lambda_lasso <- cv_lasso$lambda.min
+lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = best_lambda_lasso)
+
+# Predict on test set
+lasso_preds <- predict(lasso_model, newx = X_test)
+
+# Evaluate
+lasso_rmse <- sqrt(mean((y_test - lasso_preds)^2))
+lasso_r2 <- 1 - sum((y_test - lasso_preds)^2) / sum((y_test - mean(y_test))^2)
+
+cat("LASSO Test RMSE:", round(lasso_rmse, 2), "\n")
+cat("LASSO Test R²:", round(lasso_r2, 3), "\n")
+
+# ----- RIDGE -----
+set.seed(34)
+cv_ridge <- cv.glmnet(X_train, y_train, alpha = 0)
+best_lambda_ridge <- cv_ridge$lambda.min
+ridge_model <- glmnet(X_train, y_train, alpha = 0, lambda = best_lambda_ridge)
+
+# Predict on test set
+ridge_preds <- predict(ridge_model, newx = X_test)
+
+# Evaluate
+ridge_rmse <- sqrt(mean((y_test - ridge_preds)^2))
+ridge_r2 <- 1 - sum((y_test - ridge_preds)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Ridge Test RMSE:", round(ridge_rmse, 2), "\n")
+cat("Ridge Test R²:", round(ridge_r2, 3), "\n")
+
+
+# Fit final Ridge model
+ridge_model <- glmnet(X, y, alpha = 0, lambda = best_lambda_ridge)
+
+# View coefficients
+ridge_coefs <- coef(ridge_model)
+print(ridge_coefs)
+
+# Convert coefficient matrices to data frames
+ridge_df <- data.frame(
+  Feature = rownames(as.matrix(ridge_coefs)),
+  Ridge = as.numeric(ridge_coefs)
+)
+
+lasso_df <- data.frame(
+  Feature = rownames(as.matrix(lasso_coefs)),
+  LASSO = as.numeric(lasso_coefs)
+)
+
+# Merge for comparison
+lasso_ridge_compare <- merge(ridge_df, lasso_df, by = "Feature")
+lasso_ridge_compare <- lasso_ridge_compare %>%
+  arrange(desc(abs(LASSO)))  # sort by LASSO effect size
+
+# View and save
+print(lasso_ridge_compare)
+
+# Training predictions
+lasso_train_preds <- predict(lasso_model, newx = X_train)
+ridge_train_preds <- predict(ridge_model, newx = X_train)
+
+# LASSO metrics
+lasso_train_rmse <- sqrt(mean((y_train - lasso_train_preds)^2))
+lasso_train_r2 <- 1 - sum((y_train - lasso_train_preds)^2) / sum((y_train - mean(y_train))^2)
+
+cat("LASSO Train RMSE:", round(lasso_train_rmse, 2), " | Test RMSE:", round(lasso_rmse, 2), "\n")
+cat("LASSO Train R²:", round(lasso_train_r2, 3), " | Test R²:", round(lasso_r2, 3), "\n")
+
+# Ridge metrics
+ridge_train_rmse <- sqrt(mean((y_train - ridge_train_preds)^2))
+ridge_train_r2 <- 1 - sum((y_train - ridge_train_preds)^2) / sum((y_train - mean(y_train))^2)
+
+cat("Ridge Train RMSE:", round(ridge_train_rmse, 2), " | Test RMSE:", round(ridge_rmse, 2), "\n")
+cat("Ridge Train R²:", round(ridge_train_r2, 3), " | Test R²:", round(ridge_r2, 3), "\n")
+
+overfit_summary <- data.frame(
+  Model = c("XGBoost", "Random Forest", "LASSO", "Ridge"),
+  Train_RMSE = c(train_rmse_xgb, rf_train_rmse, lasso_train_rmse, ridge_train_rmse),
+  Test_RMSE  = c(rmse, rf_rmse, lasso_rmse, ridge_rmse),
+  Train_R2   = c(train_r2_xgb, rf_train_r2, lasso_train_r2, ridge_train_r2),
+  Test_R2    = c(r2, rf_r2, lasso_r2, ridge_r2)
+)
+
+print(overfit_summary)
+
+
+# Convert to long format for easy plotting
+overfit_long <- overfit_summary %>%
+  pivot_longer(cols = c(Train_RMSE, Test_RMSE, Train_R2, Test_R2),
+               names_to = c("Data", ".value"),
+               names_pattern = "(Train|Test)_(.*)")
+
+# ---- RMSE Plot ----
+p_rmse_overfit <- ggplot(overfit_long, aes(x = Model, y = RMSE, fill = Data)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(RMSE, 2)), position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.5) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Train vs Test RMSE by Model", y = "RMSE", x = NULL) +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# ---- R² Plot ----
+p_r2_overfit <- ggplot(overfit_long, aes(x = Model, y = R2, fill = Data)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(R2, 3)), position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.5) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Train vs Test R² by Model", y = "R²", x = NULL) +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Combine both
+p_rmse_overfit + p_r2_overfit + plot_annotation(title = "Overfitting Comparison Across Models")
+
+
+
+#Lets see how the ridge coefficients are estimated 
+ridge_coefs <- broom::tidy(ridge_model)
+
+ridge_coefs <- ridge_coefs %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate)))
+ggplot(ridge_coefs, aes(x = reorder(term, estimate), y = estimate, fill = estimate > 0)) +
+  geom_col(width = 0.6) +
+  coord_flip() +
+  scale_fill_manual(values = c("#D84B48", "#4C72B0"),
+                    labels = c("Negative Effect", "Positive Effect")) +
+  labs(
+    title = "Ridge Feature Importance (All Coefficients Shrunk, None Dropped)",
+    subtitle = "Magnitude and direction of Ridge regression coefficients for YAC prediction",
+    x = "Feature",
+    y = "Coefficient Estimate",
+    fill = "Effect Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, color = "gray40")
+  )
 
